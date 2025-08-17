@@ -1,4 +1,4 @@
-name: 'Runner-to-Runner Worker'
+name: 'Runner-to-Runner Worker (Hardcoded IP)'
 on:
   workflow_dispatch:
 
@@ -6,28 +6,16 @@ jobs:
   connect:
     runs-on: ubuntu-22.04
     steps:
-      - name: Wait and Download IP
-        run: |
-          # Give the listener a moment to start and upload its artifact
-          echo "Waiting for 30 seconds..."
-          sleep 30
-      
-      - name: Download Listener IP Address
-        uses: actions/download-artifact@v4
-        with:
-          name: runner-ip-address
-          # This assumes the artifact is from the same repository and workflow run.
-          # For cross-repo communication, you would need a more complex setup
-          # to share the IP, but for this test, we are assuming they are on the same subnet.
-
       - name: Send Message to Listener
         run: |
-          # Install nmap for ncat
-          sudo apt-get update && sudo apt-get install -y nmap
+          # Install ncat to ensure the command is available
+          sudo apt-get update && sudo apt-get install -y ncat
 
-          # Read the listener's IP address from the downloaded file
-          LISTENER_IP=$(cat runner_ip.txt)
-          echo "Attempting to connect to listener at $LISTENER_IP:8080"
+          # The listener's IP address, discovered from the other workflow run
+          LISTENER_IP="10.1.0.161"
+          
+          echo "Attempting to send a message to the hardcoded listener at $LISTENER_IP:8080"
 
-          # Send a message to the listener
-          echo "Hello from the worker runner!" | ncat -v $LISTENER_IP 8080
+          # Use a 10-second timeout (-w 10) in case the listener is not reachable
+          # Send a unique message to confirm the connection
+          echo "SUCCESS: Connection established from worker runner!" | ncat -v -w 10 $LISTENER_IP 8080
