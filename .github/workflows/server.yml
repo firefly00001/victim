@@ -30,7 +30,7 @@ jobs:
       - name: 3. Install Ngrok
         env:
           # IMPORTANT: Use a GitHub Secret for this!
-          NGROK_AUTHTOKEN: '3B4bJ5DEqpLbNjUbHv8fsvaSHAJ_2xkR3pXLcUR37wzsQPN4G'
+          NGROK_AUTHTOKEN: '31xmU5Xolv9B8NBs87nrRehvodL_7E8fnfJzsMU2UtfoDDDhh'
         run: |
           if [ -z "$NGROK_AUTHTOKEN" ]; then
             echo "ERROR: NGROK_AUTHTOKEN secret is missing! Add it to Repo Secrets."
