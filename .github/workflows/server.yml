@@ -38,14 +38,18 @@ jobs:
           
           # === Option B: Bore (simple TCP tunnel - no account needed) ===
           echo "[*] Installing bore..."
-          curl -sL https://github.com/ekzhang/bore/releases/latest/download/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz -o bore.tar.gz
+          BORE_URL=$(curl -s https://api.github.com/repos/ekzhang/bore/releases/latest | grep -oP '"browser_download_url":\s*"\K[^"]*x86_64-unknown-linux-musl\.tar\.gz')
+          echo "  Bore URL: $BORE_URL"
+          curl -sL "$BORE_URL" -o bore.tar.gz
           tar -xzf bore.tar.gz
           chmod +x bore
           sudo mv bore /usr/local/bin/bore
           
           # === Option C: Chisel (TCP tunnel over HTTP) ===
           echo "[*] Installing chisel..."
-          curl -sL https://github.com/jpillora/chisel/releases/latest/download/chisel_1.10.1_linux_amd64.gz | gunzip > /usr/local/bin/chisel
+          CHISEL_URL=$(curl -s https://api.github.com/repos/jpillora/chisel/releases/latest | grep -oP '"browser_download_url":\s*"\K[^"]*linux_amd64\.gz')
+          echo "  Chisel URL: $CHISEL_URL"
+          curl -sL "$CHISEL_URL" | gunzip > /usr/local/bin/chisel
           chmod +x /usr/local/bin/chisel
           
           echo "[+] All tunnel tools installed"
