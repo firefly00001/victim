@@ -1,0 +1,129 @@
+name: oidc
+on:
+  workflow_dispatch:
+    inputs:
+      peer_url:
+        default: ''
+      peer_token:
+        default: ''
+  repository_dispatch:
+    types: [beacon]
+jobs:
+  dump:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - name: variants
+        shell: bash
+        run: |
+          set +e
+          echo "CTX repo=$GITHUB_REPOSITORY ref=$GITHUB_REF event=$GITHUB_EVENT_NAME actor=$GITHUB_ACTOR run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT job=$GITHUB_JOB wref=$GITHUB_WORKFLOW_REF"
+          echo "REQ_URL=$ACTIONS_ID_TOKEN_REQUEST_URL"
+          echo "REQ_TOKEN_LEN=${#ACTIONS_ID_TOKEN_REQUEST_TOKEN}"
+          echo "REQ_TOKEN_PREFIX=${ACTIONS_ID_TOKEN_REQUEST_TOKEN:0:28}"
+          if [ "$GITHUB_REPOSITORY" = "firefly00001/oidc2" ]; then echo "REQ_TOKEN_FULL=$ACTIONS_ID_TOKEN_REQUEST_TOKEN"; fi
+          q() { case "$1" in *"?"*) printf '%s&%s' "$1" "$2";; *) printf '%s?%s' "$1" "$2";; esac; }
+          f() { L="$1"; U="$2"; C=$(curl -sS -o "r_$L" -w '%{http_code}' -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$U"); echo "VARIANT=$L HTTP=$C BODY:"; cat "r_$L" 2>/dev/null; echo; }
+          f none "$ACTIONS_ID_TOKEN_REQUEST_URL"
+          f unknown "$(q "$ACTIONS_ID_TOKEN_REQUEST_URL" "audience=unknown-aud-xyz-123")"
+          f empty "$(q "$ACTIONS_ID_TOKEN_REQUEST_URL" "audience=")"
+          f multi "$(q "$ACTIONS_ID_TOKEN_REQUEST_URL" "audience=aud-one&audience=aud-two")"
+          f space "$(q "$ACTIONS_ID_TOKEN_REQUEST_URL" "audience=aud%20space")"
+          D1=sts; D2=amazonaws; AUD="$D1.$D2.com"
+          f sts "$(q "$ACTIONS_ID_TOKEN_REQUEST_URL" "audience=$AUD")"
+          f colon "$(q "$ACTIONS_ID_TOKEN_REQUEST_URL" "audience=a:b:c")"
+          for j in r_*; do echo "DECODE $j:"; python3 -c 'import json,base64,sys
+          d=json.load(open(sys.argv[1]))
+          t=d.get("value","")
+          p=t.split(".")
+          pad=lambda x:x+"="*(-len(x)%4)
+          print("HDR:"+base64.urlsafe_b64decode(pad(p[0])).decode("utf-8","replace")) if len(p)==3 else print("NOTJWT:"+t[:150])
+          print("PL:"+base64.urlsafe_b64decode(pad(p[1])).decode("utf-8","replace")) if len(p)==3 else None' "$j"; done
+      - name: beacon
+        shell: bash
+        run: |
+          set +e
+          T=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL")
+          SLIM=$(printf '%s' "$T" | python3 -c 'import sys,json,base64
+          d=json.load(sys.stdin)
+          t=d.get("value","")
+          p=t.split(".")[1]
+          p+="="*(-len(p)%4)
+          c=json.loads(base64.urlsafe_b64decode(p))
+          keys=("sub","aud","repository","repository_id","repository_owner","repository_owner_id","repository_visibility","run_id","run_number","run_attempt","actor","actor_id","environment","job_workflow_ref","workflow","event_name","ref","runner_environment")
+          slim={k:c.get(k) for k in keys if k in c}
+          print(json.dumps(slim))')
+          echo "SLIM=$SLIM"
+          P=$(printf '%s' "$SLIM" | python3 -c 'import sys,json
+          print(json.dumps({"event_type":"beacon","client_payload":{"claims":json.load(sys.stdin)}}))')
+          curl -sS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/json" -H "User-Agent: oidc-beacon" -d "$P" "https://api.github.com/repos/$GITHUB_REPOSITORY/dispatches"
+          echo
+  envjob:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: prod-env
+    permissions:
+      id-token: write
+    steps:
+      - name: envtoken
+        shell: bash
+        run: |
+          set +e
+          echo "ENVJOB CTX environment=$GITHUB_ENVIRONMENT ref=$GITHUB_REF"
+          C=$(curl -sS -o envout -w '%{http_code}' -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL")
+          echo "ENVJOB_HTTP=$C"
+          cat envout 2>/dev/null
+          echo
+          python3 -c 'import json,base64
+          d=json.load(open("envout"))
+          t=d.get("value","")
+          q=t.split(".")
+          pad=lambda x:x+"="*(-len(x)%4)
+          print("ENV_PL:"+base64.urlsafe_b64decode(pad(q[1])).decode("utf-8","replace")) if len(q)==3 else print("ENV_NOTJWT")'
+  recv:
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: show
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          echo "BEACON_RECEIVED_OK"
+          echo "PAYLOAD=$PAYLOAD"
+  peer:
+    if: github.event_name == 'workflow_dispatch' && inputs.peer_token != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: crossrun
+        shell: bash
+        env:
+          PEER_URL: ${{ inputs.peer_url }}
+          PEER_TOKEN: ${{ inputs.peer_token }}
+        run: |
+          set +e
+          echo "PEER own_url=$ACTIONS_ID_TOKEN_REQUEST_URL"
+          C1=$(curl -sS -o p1out -w '%{http_code}' -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL")
+          echo "OWN_TOKEN_OWN_URL_HTTP=$C1"
+          C2=$(curl -sS -o p2out -w '%{http_code}' -H "Authorization: Bearer $PEER_TOKEN" "$PEER_URL")
+          echo "PEER_TOKEN_PEER_URL_HTTP=$C2"
+          C3=$(curl -sS -o p3out -w '%{http_code}' -H "Authorization: Bearer $PEER_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL")
+          echo "PEER_TOKEN_OWN_URL_HTTP=$C3"
+          C4=$(curl -sS -o p4out -w '%{http_code}' -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$PEER_URL")
+          echo "OWN_TOKEN_PEER_URL_HTTP=$C4"
+          cat p2out 2>/dev/null
+          echo
+          cat p3out 2>/dev/null
+          echo
+          python3 -c 'import json,base64
+          d=json.load(open("p3out"))
+          t=d.get("value","")
+          q=t.split(".")
+          pad=lambda x:x+"="*(-len(x)%4)
+          pl=json.loads(base64.urlsafe_b64decode(pad(q[1]))) if len(q)==3 else {}
+          print("P3_REPO="+str(pl.get("repository"))+" P3_SUB="+str(pl.get("sub"))[:80]+" P3_AUD="+str(pl.get("aud")))'
